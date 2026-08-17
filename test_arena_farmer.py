@@ -4495,6 +4495,37 @@ class CoreFarmerTests(unittest.TestCase):
         self.assertEqual(queued["unit_actions"][WORKER_1]["type"], "MOVE")
         self.assertEqual(queued["unit_actions"][WORKER_1]["direction"], "LEFT")
 
+    def test_returning_scout_does_not_step_back_into_contact_lane(self) -> None:
+        tactic = CoreFarmer(worker_target=1, beacon_policy="hold")
+        contacted = make_turn(
+            tick=100,
+            units=[unit(WORKER_1, "WORKER", (0, 5), cargo=0)],
+            enemies=[unit(ENEMY_1, "VANGUARD", (0, 1), controlled=False)],
+            obstacles=[(-1, 5), (1, 5)],
+        )
+        tactic.choose_actions(contacted)
+        contacted_plan = contacted.plan.model_dump(mode="json", exclude_none=True)
+
+        self.assertEqual(
+            contacted_plan["unit_actions"][WORKER_1]["direction"],
+            "DOWN",
+        )
+
+        hidden = make_turn(
+            tick=101,
+            units=[unit(WORKER_1, "WORKER", (0, 6), cargo=0)],
+            obstacles=[(-1, 5), (1, 5)],
+        )
+        tactic.choose_actions(hidden)
+        hidden_plan = hidden.plan.model_dump(mode="json", exclude_none=True)
+
+        self.assertEqual(tactic.worker_modes[UUID(WORKER_1)], "SCOUT_RETURN")
+        self.assertEqual(hidden_plan["unit_actions"][WORKER_1]["type"], "MOVE")
+        self.assertNotEqual(
+            hidden_plan["unit_actions"][WORKER_1]["direction"],
+            "UP",
+        )
+
     def test_new_contact_interrupts_scout_cooldown(self) -> None:
         tactic = CoreFarmer(worker_target=1, beacon_policy="hold")
         tactic.scout_cooldown_until[UUID(WORKER_1)] = 105

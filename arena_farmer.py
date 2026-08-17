@@ -110,6 +110,7 @@ RESOURCE_STALL_TICKS = 6
 RESOURCE_COOLDOWN_TICKS = 8
 RESOURCE_ASSIGNMENT_STICKY_BONUS = 2
 SCOUT_STALL_TICKS = 3
+SCOUT_RETURN_HISTORY_PENALTY = 16
 RECOVERY_TICKS = 160
 RECOVERY_VANGUARD_WORKER_GOAL = 4
 RECOVERY_MIN_WORKERS = 6
@@ -640,6 +641,7 @@ def _path_directions(
     blocked: set[Position],
     *,
     discouraged: set[Position] | None = None,
+    discouraged_penalty: int = 4,
     max_expansions: int = 4096,
 ) -> tuple[Direction, ...]:
     if start == target:
@@ -687,7 +689,7 @@ def _path_directions(
                 continue
             new_cost = current_cost + 1
             if destination in discouraged:
-                new_cost += 4
+                new_cost += discouraged_penalty
             if new_cost >= costs.get(destination, sys.maxsize):
                 continue
             costs[destination] = new_cost
@@ -1159,6 +1161,7 @@ def _queue_toward(
     allow_target_entry: bool = False,
     allow_single_friendly_transit: bool = False,
     discouraged: set[Position] | None = None,
+    discouraged_penalty: int = 4,
     avoid_danger: bool = True,
 ) -> bool:
     blocked = (
@@ -1190,6 +1193,7 @@ def _queue_toward(
         target,
         blocked,
         discouraged=combined_discouraged,
+        discouraged_penalty=discouraged_penalty,
     )
     if not directions:
         return False
@@ -3698,6 +3702,8 @@ class CoreFarmer:
             context,
             allow_core_entry=True,
             allow_single_friendly_transit=True,
+            discouraged=set(self.worker_history.get(worker.id, ())),
+            discouraged_penalty=SCOUT_RETURN_HISTORY_PENALTY,
         ):
             self._set_worker_mode(worker, "SCOUT_RETURN", core.position)
         else:
