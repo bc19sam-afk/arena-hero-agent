@@ -530,6 +530,21 @@ class CoreFarmerTests(unittest.TestCase):
         self.assertEqual(tactic.resource_intents[UUID(WORKER_1)], (-5, 0))
         self.assertEqual(tactic.resource_intents[UUID(WORKER_2)], (4, 0))
 
+    def test_resource_assignment_accounts_for_return_trip_to_core(self) -> None:
+        tactic = CoreFarmer(beacon_policy="hold")
+        turn = make_turn(
+            tick=20,
+            core_position=(0, 0),
+            units=[unit(WORKER_1, "WORKER", (10, 0), cargo=0)],
+            resource_cells=[(8, 0), (11, 0)],
+        )
+
+        tactic.choose_actions(turn)
+        queued = turn.plan.model_dump(mode="json", exclude_none=True)
+
+        self.assertEqual(tactic.resource_intents[UUID(WORKER_1)], (8, 0))
+        self.assertEqual(queued["unit_actions"][WORKER_1]["direction"], "LEFT")
+
     def test_worker_enters_resource_cell_occupied_by_one_friendly_defender(self) -> None:
         tactic = CoreFarmer(worker_target=1, beacon_policy="hold")
         turn = make_turn(
@@ -3835,6 +3850,47 @@ class CoreFarmerTests(unittest.TestCase):
         self.assertEqual(queued["unit_actions"][VANGUARD_2]["type"], "SWEEP")
         self.assertEqual(queued["unit_actions"][RANGER_2]["type"], "SHOOT")
         self.assertEqual(queued["core_action"]["type"], "START_MOVE")
+
+    def test_second_ranger_leads_confirmed_moving_pursuer(self) -> None:
+        tactic = CoreFarmer(worker_target=1, beacon_policy="hold")
+        defenders = [
+            unit(RANGER_1, "RANGER", (0, 0)),
+            unit(RANGER_2, "RANGER", (0, 0)),
+        ]
+        for tick, position in ((100, (5, 0)), (101, (4, 0))):
+            tactic.choose_actions(
+                make_turn(
+                    tick=tick,
+                    core_position=(0, 5),
+                    beacon_position=(0, 5),
+                    units=defenders,
+                    enemies=[
+                        unit(ENEMY_1, "RANGER", position, controlled=False)
+                    ],
+                )
+            )
+
+        firing = make_turn(
+            tick=102,
+            core_position=(0, 5),
+            beacon_position=(0, 5),
+            units=defenders,
+            enemies=[unit(ENEMY_1, "RANGER", (3, 0), controlled=False)],
+        )
+        tactic.choose_actions(firing)
+        actions = firing.plan.model_dump(mode="json", exclude_none=True)[
+            "unit_actions"
+        ]
+
+        self.assertEqual(actions[RANGER_1]["type"], "SHOOT")
+        self.assertEqual(actions[RANGER_2]["type"], "SHOOT")
+        self.assertEqual(
+            {
+                tuple(actions[RANGER_1]["expected_cell"]),
+                tuple(actions[RANGER_2]["expected_cell"]),
+            },
+            {(3, 0), (2, 0)},
+        )
 
     def test_pursuit_survives_one_tick_visibility_gap(self) -> None:
         tactic = CoreFarmer(worker_target=1, beacon_policy="hold")

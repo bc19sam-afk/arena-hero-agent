@@ -98,6 +98,7 @@ RECENT_ATTACK_MEMORY_TICKS = 6
 PURSUIT_MEMORY_TTL = 2
 PURSUIT_SCORE_MAX = 4
 DISTANT_PURSUIT_SCORE_THRESHOLD = 3
+PREDICTION_MIN_OBSERVATIONS = 2
 ACTIVE_ENEMY_ALERT_TICKS = 2
 CORE_PREEMPTIVE_EVADE_HORIZON_TICKS = 16
 SQUAD_DISENGAGE_TICKS = 8
@@ -281,6 +282,8 @@ class EnemyUnitMotion:
     last_tick: int
     core_distance: int
     unit_type: UnitType
+    movement_delta: Position | None = None
+    movement_observations: int = 0
     pursuit_score: int = 0
     pursuit_ticks: int = 0
     activity_until_tick: int = 0
@@ -1337,6 +1340,20 @@ def _ranger_can_shoot(
     )
 
 
+def _predicted_motion_cell(motion: EnemyUnitMotion | None) -> Position | None:
+    if (
+        motion is None
+        or motion.movement_delta is None
+        or motion.movement_observations < PREDICTION_MIN_OBSERVATIONS
+    ):
+        return None
+    predicted = (
+        motion.position[0] + motion.movement_delta[0],
+        motion.position[1] + motion.movement_delta[1],
+    )
+    return predicted if _is_signed_int64_position(predicted) else None
+
+
 def _enemy_threat_cells(
     enemies: Sequence[object],
     obstacles: set[Position],
@@ -2201,6 +2218,8 @@ class CoreFarmer:
             activity_until_tick = 0
             preemptive_evade_until_tick = 0
             ticks_to_attack_range = None
+            movement_delta = None
+            movement_observations = 0
             if (
                 previous_motion is not None
                 and turn.tick - previous_motion.last_tick
@@ -2222,6 +2241,18 @@ class CoreFarmer:
                 if previous_motion.position == enemy_unit.position:
                     pursuit_score = 0
                 else:
+                    if observation_gap == 1:
+                        observed_delta = (
+                            enemy_unit.position[0] - previous_motion.position[0],
+                            enemy_unit.position[1] - previous_motion.position[1],
+                        )
+                        if abs(observed_delta[0]) + abs(observed_delta[1]) == 1:
+                            movement_delta = observed_delta
+                            movement_observations = (
+                                previous_motion.movement_observations + 1
+                                if previous_motion.movement_delta == observed_delta
+                                else 1
+                            )
                     activity_until_tick = turn.tick + ACTIVE_ENEMY_ALERT_TICKS
                     closed_distance = previous_motion.core_distance - core_distance
                     if closed_distance > 0:
@@ -2257,6 +2288,8 @@ class CoreFarmer:
                 last_tick=turn.tick,
                 core_distance=core_distance,
                 unit_type=enemy_unit.unit_type,
+                movement_delta=movement_delta,
+                movement_observations=movement_observations,
                 pursuit_score=pursuit_score,
                 pursuit_ticks=pursuit_ticks,
                 activity_until_tick=activity_until_tick,
@@ -2768,6 +2801,7 @@ class CoreFarmer:
         *,
         tick: int,
         blocked: set[Position],
+        core_position: Position,
     ) -> dict[UUID, Position]:
         available_resources = {
             cell for cell in self.resource_last_seen if cell not in blocked
@@ -2788,7 +2822,11 @@ class CoreFarmer:
                     row.append(forbidden_cost)
                     continue
                 path_cost = _estimated_path_cost(worker.position, cell, blocked)
-                if path_cost >= PATH_COST_UNREACHABLE:
+                return_cost = _estimated_path_cost(cell, core_position, blocked)
+                if (
+                    path_cost >= PATH_COST_UNREACHABLE
+                    or return_cost >= PATH_COST_UNREACHABLE
+                ):
                     row.append(forbidden_cost)
                     continue
                 age = tick - self.resource_last_seen[cell]
@@ -2799,7 +2837,13 @@ class CoreFarmer:
                     else 0
                 )
                 row.append(
-                    max(0, path_cost + stale_penalty - sticky_bonus)
+                    max(
+                        0,
+                        path_cost
+                        + return_cost
+                        + stale_penalty
+                        - sticky_bonus,
+                    )
                 )
             row.extend([unassigned_cost] * len(ordered_workers))
             cost_matrix.append(row)
@@ -3313,6 +3357,7 @@ class CoreFarmer:
             economic_empty_workers,
             tick=turn.tick,
             blocked=resource_route_blocked,
+            core_position=core.position,
         )
         current_resources = set(turn.resource_cells)
         departing_core_workers = [
@@ -3906,6 +3951,8 @@ class CoreFarmer:
             context.obstacles,
         )
         _, strike_rangers = self._strike_group_ids(turn, isolated_core_target)
+        ranger_current_targets: set[UUID] = set()
+        predicted_enemy_ids: set[UUID] = set()
         for index, ranger in enumerate(
             sorted(turn.rangers, key=_uuid_sort_key)
         ):
@@ -3965,8 +4012,34 @@ class CoreFarmer:
                         planned_damage,
                     ),
                 )
-                _queue_ranger_attack(ranger, pursuer, turn.visible_enemies)
-                _record_planned_target_damage(pursuer, planned_damage)
+                predicted_cell = None
+                if (
+                    pursuer.id in ranger_current_targets
+                    and pursuer.id not in predicted_enemy_ids
+                ):
+                    predicted_cell = _predicted_motion_cell(
+                        self.enemy_unit_motion.get(pursuer.id)
+                    )
+                if (
+                    predicted_cell is not None
+                    and predicted_cell not in context.obstacles
+                    and _ranger_can_shoot(
+                        ranger.position,
+                        predicted_cell,
+                        context.obstacles,
+                    )
+                ):
+                    ranger.shoot_cell(predicted_cell)
+                    predicted_enemy_ids.add(pursuer.id)
+                    _record_planned_cell_damage(
+                        predicted_cell,
+                        turn.visible_enemies,
+                        planned_damage,
+                    )
+                else:
+                    _queue_ranger_attack(ranger, pursuer, turn.visible_enemies)
+                    _record_planned_target_damage(pursuer, planned_damage)
+                    ranger_current_targets.add(pursuer.id)
                 continue
             strike_member = ranger.id in strike_rangers
             if strike_member:
