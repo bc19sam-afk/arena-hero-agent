@@ -1770,7 +1770,7 @@ class CoreFarmerTests(unittest.TestCase):
 
         target = tactic._scout_target(worker_id, (0, 0), None)
 
-        self.assertEqual(target, (40, 0))
+        self.assertNotEqual((target[0] // 32, target[1] // 32), (0, 0))
 
     def test_hold_policy_never_routes_core_or_scouts_toward_beacon(self) -> None:
         tactic = CoreFarmer(beacon_policy="hold")

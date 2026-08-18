@@ -7,6 +7,10 @@ param(
     [int]$WorkerTarget = 18,
     [ValidateSet("hold", "pursue", "retreat")]
     [string]$BeaconPolicy = "retreat",
+    [string]$CompatibilityMarker,
+    [string]$HeartbeatFile,
+    [ValidateRange(0, 86400)]
+    [double]$StaleTurnTimeoutSeconds = 0,
     [string]$BaseUrl,
     [switch]$NoCompatibilityMarker
 )
@@ -65,9 +69,11 @@ if (-not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) {
 }
 
 $keyInEnvironment = -not [string]::IsNullOrWhiteSpace($env:ARENA_HERO_API_KEY)
-$keyInFile = Test-Path -LiteralPath $envPath -PathType Leaf -and
+$keyInFile = (
+    (Test-Path -LiteralPath $envPath -PathType Leaf) -and
     (Select-String -LiteralPath $envPath -Pattern '^\s*ARENA_HERO_API_KEY\s*=\s*\S+' -Quiet) -and
     -not (Select-String -LiteralPath $envPath -Pattern '^\s*ARENA_HERO_API_KEY\s*=\s*(replace-with|your-|<)' -Quiet)
+)
 if (-not $keyInEnvironment -and -not $keyInFile) {
     Write-Host "No Arena Hero API key was found. The key will be appended to $envPath."
     $secureKey = Read-Host "Enter the current Arena Hero API key" -AsSecureString
@@ -113,6 +119,15 @@ if (-not [string]::IsNullOrWhiteSpace($BaseUrl)) {
 }
 if ($NoCompatibilityMarker) {
     $agentArguments += "--no-compatibility-marker"
+}
+elseif (-not [string]::IsNullOrWhiteSpace($CompatibilityMarker)) {
+    $agentArguments += @("--compatibility-marker", (Resolve-ProjectPath $CompatibilityMarker))
+}
+if (-not [string]::IsNullOrWhiteSpace($HeartbeatFile)) {
+    $agentArguments += @("--heartbeat-file", (Resolve-ProjectPath $HeartbeatFile))
+}
+if ($StaleTurnTimeoutSeconds -gt 0) {
+    $agentArguments += @("--stale-turn-timeout-seconds", $StaleTurnTimeoutSeconds)
 }
 
 Set-Location -LiteralPath $projectRoot

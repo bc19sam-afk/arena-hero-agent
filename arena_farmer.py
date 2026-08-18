@@ -169,19 +169,42 @@ RANGER_LINE_VECTORS = (
     (-1, 0),
     (-1, -1),
 )
-SCOUT_VECTORS = (
-    (1, 0),
-    (1, 1),
-    (0, 1),
-    (-1, 1),
-    (-1, 0),
-    (-1, -1),
-    (0, -1),
-    (1, -1),
+# A worker's vision radius is three cells.  Six horizontal/vertical lanes with
+# at most six cells between them cover every cell in a 32x32 chunk while still
+# leaving enough room for obstacle detours.  Each pair of points makes a full
+# lane crossing; alternating the direction prevents the old radial waypoint
+# plan from repeatedly walking the same narrow rays.
+SCOUT_SCAN_WAYPOINTS = (
+    (2, 2),
+    (29, 2),
+    (29, 8),
+    (2, 8),
+    (2, 14),
+    (29, 14),
+    (29, 20),
+    (2, 20),
+    (2, 26),
+    (29, 26),
+    (29, 31),
+    (2, 31),
 )
-SCOUT_STAGE_CYCLE = len(SCOUT_VECTORS)
-SCOUT_RING_STEP = 10
-SCOUT_RING_COUNT = 4
+SCOUT_STAGE_CYCLE = len(SCOUT_SCAN_WAYPOINTS)
+SCOUT_CHUNK_SEARCH_RADIUS = 4
+SCOUT_CHUNK_OFFSETS = tuple(
+    sorted(
+        (
+            (dx, dy)
+            for dx in range(-SCOUT_CHUNK_SEARCH_RADIUS, SCOUT_CHUNK_SEARCH_RADIUS + 1)
+            for dy in range(-SCOUT_CHUNK_SEARCH_RADIUS, SCOUT_CHUNK_SEARCH_RADIUS + 1)
+        ),
+        key=lambda offset: (
+            abs(offset[0]) + abs(offset[1]),
+            max(abs(offset[0]), abs(offset[1])),
+            offset[0],
+            offset[1],
+        ),
+    )
+)
 SCOUT_COVERAGE_MEMORY_TTL = 4096
 
 Position = tuple[int, int]
@@ -1662,6 +1685,7 @@ class CoreFarmer:
         self.scout_progress: dict[UUID, ScoutProgress] = {}
         self.scout_target_last_visited: dict[Position, int] = {}
         self.scout_claims: set[Position] = set()
+        self.scout_active_chunks: dict[UUID, Position] = {}
         self.scout_chunk_last_seen: dict[Position, int] = {}
         self.worker_history: dict[UUID, deque[Position]] = {}
         self.resource_last_seen: dict[Position, int] = {}
@@ -2655,6 +2679,7 @@ class CoreFarmer:
         self.resource_cooldowns.clear()
         self.scout_target_last_visited.clear()
         self.scout_claims.clear()
+        self.scout_active_chunks.clear()
         self.scout_chunk_last_seen.clear()
         self.enemy_unit_sightings.clear()
         self.enemy_unit_motion.clear()
@@ -2887,6 +2912,7 @@ class CoreFarmer:
             self.scout_slots.pop(worker_id, None)
             self.scout_stages.pop(worker_id, None)
             self.scout_progress.pop(worker_id, None)
+            self.scout_active_chunks.pop(worker_id, None)
             self.worker_history.pop(worker_id, None)
 
         used_slots = set(self.scout_slots.values())
@@ -2901,6 +2927,84 @@ class CoreFarmer:
             self.scout_stages[worker_id] = 0
             used_slots.add(slot)
 
+    def _scout_chunk_waypoint(
+        self,
+        worker_id: UUID,
+        chunk: Position,
+        stage: int | None = None,
+    ) -> Position:
+        slot = self.scout_slots[worker_id]
+        waypoint_index = (
+            self.scout_stages[worker_id] if stage is None else stage
+        ) % SCOUT_STAGE_CYCLE
+        local_x, local_y = SCOUT_SCAN_WAYPOINTS[waypoint_index]
+        if slot % 2:
+            local_x, local_y = local_y, local_x
+        return chunk[0] * 32 + local_x, chunk[1] * 32 + local_y
+
+    def _select_scout_chunk(
+        self,
+        worker_id: UUID,
+        core_position: Position,
+        beacon_position: Position | None,
+    ) -> Position:
+        core_chunk = _chunk_coordinates(core_position)
+        claimed_chunks = {
+            chunk
+            for owner, chunk in self.scout_active_chunks.items()
+            if owner != worker_id
+        }
+        minimum_beacon_distance = None
+        if beacon_position is not None and self.beacon_policy != "pursue":
+            minimum_beacon_distance = min(
+                RETREAT_MIN_BEACON_DISTANCE,
+                _distance(core_position, beacon_position),
+            )
+
+        candidates: list[Position] = []
+        for offset_x, offset_y in SCOUT_CHUNK_OFFSETS:
+            chunk = core_chunk[0] + offset_x, core_chunk[1] + offset_y
+            if chunk in claimed_chunks:
+                continue
+            if minimum_beacon_distance is not None and any(
+                _distance(
+                    self._scout_chunk_waypoint(worker_id, chunk, stage),
+                    beacon_position,
+                )
+                < minimum_beacon_distance
+                for stage in range(SCOUT_STAGE_CYCLE)
+            ):
+                continue
+            candidates.append(chunk)
+
+        if not candidates:
+            candidates = [
+                (core_chunk[0] + offset_x, core_chunk[1] + offset_y)
+                for offset_x, offset_y in SCOUT_CHUNK_OFFSETS
+                if (core_chunk[0] + offset_x, core_chunk[1] + offset_y)
+                not in claimed_chunks
+            ]
+        if not candidates:
+            return core_chunk
+
+        slot = self.scout_slots[worker_id]
+        return min(
+            candidates,
+            key=lambda chunk: (
+                self.scout_chunk_last_seen.get(chunk, -1),
+                -_chunk_resource_quota(
+                    (chunk[0] * 32 + 16, chunk[1] * 32 + 16)
+                ),
+                _distance(
+                    core_position,
+                    (chunk[0] * 32 + 16, chunk[1] * 32 + 16),
+                ),
+                (chunk[0] + chunk[1] - slot) % 2,
+                chunk[0],
+                chunk[1],
+            ),
+        )
+
     def _scout_target(
         self,
         worker_id: UUID,
@@ -2909,68 +3013,16 @@ class CoreFarmer:
         *,
         claim: bool = False,
     ) -> Position:
-        slot = self.scout_slots[worker_id]
-        stage = self.scout_stages[worker_id]
-        heading = (0, 0)
-        if beacon_position is not None and self.beacon_policy == "pursue":
-            heading = (
-                (beacon_position[0] > core_position[0])
-                - (beacon_position[0] < core_position[0]),
-                (beacon_position[1] > core_position[1])
-                - (beacon_position[1] < core_position[1]),
+        chunk = self.scout_active_chunks.get(worker_id)
+        if chunk is None:
+            chunk = self._select_scout_chunk(
+                worker_id,
+                core_position,
+                beacon_position,
             )
-        vectors = SCOUT_VECTORS
-        if heading != (0, 0):
-            vectors = tuple(
-                vector
-                for _, vector in sorted(
-                    enumerate(SCOUT_VECTORS),
-                    key=lambda item: (
-                        -(item[1][0] * heading[0] + item[1][1] * heading[1]),
-                        abs(item[1][0] * heading[1] - item[1][1] * heading[0]),
-                        item[0],
-                    ),
-                )
-            )
-        vector = vectors[(slot + stage) % len(vectors)]
-        base_ring = 1 + slot // len(SCOUT_VECTORS)
-        candidates = []
-        for ring_offset in range(SCOUT_RING_COUNT):
-            radius = SCOUT_RING_STEP * (base_ring + ring_offset)
-            vector_scale = radius // (abs(vector[0]) + abs(vector[1]))
-            candidate = (
-                core_position[0] + vector[0] * vector_scale,
-                core_position[1] + vector[1] * vector_scale,
-            )
-            if candidate in self.scout_claims:
-                continue
-            if (
-                beacon_position is not None
-                and self.beacon_policy != "pursue"
-                and _distance(candidate, beacon_position)
-                < min(
-                    RETREAT_MIN_BEACON_DISTANCE,
-                    _distance(core_position, beacon_position),
-                )
-            ):
-                continue
-            candidates.append(candidate)
-        if not candidates:
-            candidates.append(core_position)
-        target = min(
-            candidates,
-            key=lambda candidate: (
-                self.scout_chunk_last_seen.get(
-                    _chunk_coordinates(candidate),
-                    -1,
-                ),
-                self.scout_target_last_visited.get(candidate, -1),
-                -_chunk_resource_quota(candidate),
-                _distance(core_position, candidate),
-                candidate[0],
-                candidate[1],
-            ),
-        )
+            self.scout_active_chunks[worker_id] = chunk
+            self.scout_stages[worker_id] = 0
+        target = self._scout_chunk_waypoint(worker_id, chunk)
         if claim:
             self.scout_claims.add(target)
         return target
@@ -2984,9 +3036,15 @@ class CoreFarmer:
     ) -> None:
         if visited_target is not None and tick is not None:
             self.scout_target_last_visited[visited_target] = tick
-        self.scout_stages[worker_id] = (
-            self.scout_stages[worker_id] + 1
-        ) % SCOUT_STAGE_CYCLE
+        stage = self.scout_stages[worker_id]
+        if stage + 1 < SCOUT_STAGE_CYCLE:
+            self.scout_stages[worker_id] = stage + 1
+            return
+
+        completed_chunk = self.scout_active_chunks.pop(worker_id, None)
+        if completed_chunk is not None and tick is not None:
+            self.scout_chunk_last_seen[completed_chunk] = tick
+        self.scout_stages[worker_id] = 0
 
     def _scout_route_stalled(
         self,
@@ -3067,7 +3125,7 @@ class CoreFarmer:
             )
         elif self._scout_route_stalled(worker, target, context):
             self.scout_progress.pop(worker.id, None)
-            self._advance_scout(worker.id)
+            self._advance_scout(worker.id, tick=tick)
             target = self._scout_target(
                 worker.id,
                 core_position,
@@ -3080,7 +3138,7 @@ class CoreFarmer:
             context,
             discouraged=set(self.worker_history[worker.id]),
         ):
-            self._advance_scout(worker.id)
+            self._advance_scout(worker.id, tick=tick)
             target = self._scout_target(
                 worker.id,
                 core_position,
@@ -3293,8 +3351,6 @@ class CoreFarmer:
         self.worker_modes.clear()
         self.worker_targets.clear()
         self.scout_claims.clear()
-        for worker in workers:
-            self.scout_chunk_last_seen[_chunk_coordinates(worker.position)] = turn.tick
         for chunk, last_seen in tuple(self.scout_chunk_last_seen.items()):
             if turn.tick - last_seen > SCOUT_COVERAGE_MEMORY_TTL:
                 self.scout_chunk_last_seen.pop(chunk, None)
@@ -4474,15 +4530,15 @@ class CoreFarmer:
             core.wait()
             return
 
-        if isolated_core_target is not None:
-            core.wait()
-            return
-
         if (
             not enemies
             and not self.recovery_mode
             and turn.tick <= self.threat_caution_until_tick
         ):
+            core.wait()
+            return
+
+        if isolated_core_target is not None:
             core.wait()
             return
 
