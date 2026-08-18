@@ -358,6 +358,32 @@ class CoreFarmerTests(unittest.TestCase):
             )
         ]
 
+    def _start_cut_raid(
+        self,
+        *,
+        resources: int = 0,
+        with_spotter: bool = False,
+    ) -> tuple[CoreFarmer, list[dict[str, object]]]:
+        tactic = CoreFarmer(worker_target=1, beacon_policy="hold")
+        units = [
+            unit(VANGUARD_1, "VANGUARD", (0, -3)),
+            unit(VANGUARD_2, "VANGUARD", (15, 0)),
+            unit(RANGER_1, "RANGER", (-2, 0)),
+            unit(RANGER_2, "RANGER", (15, 1)),
+        ]
+        if with_spotter:
+            units.insert(0, unit(WORKER_1, "WORKER", (27, 0), cargo=0))
+        for tick in (100, 101, 102):
+            tactic.choose_actions(
+                make_turn(
+                    tick=tick,
+                    resources=resources,
+                    units=units,
+                    enemies=[enemy_core(ENEMY_1, (30, 0))],
+                )
+            )
+        return tactic, units
+
     def test_respawning_queues_no_actions(self) -> None:
         turn = make_turn(core=False)
         tactic = CoreFarmer()
@@ -2384,6 +2410,266 @@ class CoreFarmerTests(unittest.TestCase):
         for ranger_id in (RANGER_3, RANGER_4):
             self.assertNotEqual(queued["unit_actions"][ranger_id]["type"], "SHOOT")
         self.assertEqual(queued["core_action"]["type"], "WAIT")
+
+    def test_raid_episode_records_initial_context(self) -> None:
+        tactic, _ = self._start_cut_raid()
+
+        episode = tactic.active_raid_episode
+        self.assertIsNotNone(episode)
+        assert episode is not None
+        self.assertEqual(episode.target_id, UUID(ENEMY_1))
+        self.assertEqual(episode.mode, RaidMode.CUT)
+        self.assertEqual(episode.state, "ENGAGED")
+        self.assertEqual(episode.outcome, "ACTIVE")
+        self.assertEqual(episode.start_tick, 102)
+        self.assertEqual(episode.start_resources, 0)
+        self.assertEqual(episode.start_vanguard_count, 2)
+        self.assertEqual(episode.start_ranger_count, 2)
+        self.assertEqual(
+            episode.initial_member_ids,
+            {UUID(VANGUARD_2), UUID(RANGER_2)},
+        )
+        self.assertEqual(episode.initial_member_hp, 6)
+        self.assertEqual(episode.surviving_member_ids, episode.initial_member_ids)
+        self.assertEqual(episode.loss_count, 0)
+        self.assertEqual(episode.initial_defender_count, 0)
+        self.assertEqual(episode.initial_target_durability, 10)
+        self.assertEqual(episode.last_target_durability, 10)
+        self.assertEqual(episode.rebuild_vanguard_target, 2)
+        self.assertEqual(episode.rebuild_ranger_target, 2)
+
+    def test_raid_episode_waits_for_return_before_archive(self) -> None:
+        tactic, _ = self._start_cut_raid()
+        completion_units = [
+            unit(VANGUARD_1, "VANGUARD", (0, -3)),
+            unit(VANGUARD_2, "VANGUARD", (30, 0)),
+            unit(RANGER_1, "RANGER", (-2, 0)),
+            unit(RANGER_2, "RANGER", (30, 1)),
+        ]
+
+        tactic.choose_actions(
+            make_turn(tick=103, units=completion_units)
+        )
+
+        episode = tactic.active_raid_episode
+        self.assertIsNotNone(episode)
+        assert episode is not None
+        self.assertEqual(episode.state, "RETURNING")
+        self.assertEqual(episode.outcome, "COMPLETED")
+        self.assertEqual(episode.engagement_end_tick, 103)
+        self.assertEqual(len(tactic.raid_episode_history), 0)
+
+        tactic.choose_actions(
+            make_turn(
+                tick=104,
+                units=[
+                    unit(VANGUARD_1, "VANGUARD", (0, -3)),
+                    unit(VANGUARD_2, "VANGUARD", (0, 0)),
+                    unit(RANGER_1, "RANGER", (-2, 0)),
+                    unit(RANGER_2, "RANGER", (0, 1)),
+                ],
+            )
+        )
+
+        self.assertIsNone(tactic.active_raid_episode)
+        archived = tactic.raid_episode_history[-1]
+        self.assertEqual(archived.state, "READY")
+        self.assertEqual(archived.outcome, "COMPLETED")
+        self.assertEqual(archived.cycle_end_reason, "READY")
+        self.assertEqual(archived.squad_return_complete_tick, 104)
+        self.assertEqual(archived.ready_tick, 104)
+        self.assertEqual(archived.engagement_duration, 1)
+        self.assertEqual(archived.recovery_duration, 1)
+        self.assertEqual(archived.total_duration, 2)
+        self.assertEqual(archived.loss_count, 0)
+
+    def test_raid_episode_reopens_rebuild_after_return_loss(self) -> None:
+        tactic, _ = self._start_cut_raid()
+        tactic.choose_actions(
+            make_turn(
+                tick=103,
+                units=[
+                    unit(VANGUARD_1, "VANGUARD", (0, -3)),
+                    unit(VANGUARD_2, "VANGUARD", (30, 0)),
+                    unit(RANGER_1, "RANGER", (-2, 0)),
+                    unit(RANGER_2, "RANGER", (30, 1)),
+                ],
+            )
+        )
+        returning_survivors = [
+            unit(VANGUARD_1, "VANGUARD", (0, -3)),
+            unit(RANGER_1, "RANGER", (-2, 0)),
+            unit(RANGER_2, "RANGER", (0, 1)),
+        ]
+
+        tactic.choose_actions(
+            make_turn(tick=104, units=returning_survivors)
+        )
+
+        episode = tactic.active_raid_episode
+        self.assertIsNotNone(episode)
+        assert episode is not None
+        self.assertEqual(episode.state, "REBUILDING")
+        self.assertIsNone(episode.rebuild_complete_tick)
+        self.assertEqual(episode.loss_count, 1)
+        self.assertEqual(len(tactic.raid_episode_history), 0)
+
+        tactic.choose_actions(
+            make_turn(
+                tick=105,
+                units=returning_survivors
+                + [unit(VANGUARD_3, "VANGUARD", (0, 1))],
+            )
+        )
+
+        self.assertIsNone(tactic.active_raid_episode)
+        archived = tactic.raid_episode_history[-1]
+        self.assertEqual(archived.rebuild_complete_tick, 105)
+        self.assertEqual(archived.ready_tick, 105)
+        self.assertEqual(archived.loss_count, 1)
+        self.assertNotIn(UUID(VANGUARD_3), archived.surviving_member_ids)
+
+    def test_raid_episode_waits_one_tick_for_spotter_return_observation(self) -> None:
+        tactic, _ = self._start_cut_raid(with_spotter=True)
+        tactic.choose_actions(
+            make_turn(
+                tick=103,
+                units=[
+                    unit(WORKER_1, "WORKER", (27, 0), cargo=0),
+                    unit(VANGUARD_1, "VANGUARD", (0, -1)),
+                    unit(VANGUARD_2, "VANGUARD", (30, 0)),
+                    unit(RANGER_1, "RANGER", (-1, 0)),
+                    unit(RANGER_2, "RANGER", (30, 1)),
+                ],
+            )
+        )
+        home_defenders = [
+            unit(VANGUARD_1, "VANGUARD", (0, -1)),
+            unit(VANGUARD_2, "VANGUARD", (0, 0)),
+            unit(RANGER_1, "RANGER", (-1, 0)),
+            unit(RANGER_2, "RANGER", (0, 1)),
+        ]
+        tactic.choose_actions(
+            make_turn(
+                tick=104,
+                units=[unit(WORKER_1, "WORKER", (27, 0), cargo=0)]
+                + home_defenders,
+            )
+        )
+        tactic.choose_actions(
+            make_turn(
+                tick=105,
+                units=[unit(WORKER_1, "WORKER", (0, 0), cargo=0)]
+                + home_defenders,
+            )
+        )
+
+        episode = tactic.active_raid_episode
+        self.assertIsNotNone(episode)
+        assert episode is not None
+        self.assertEqual(episode.return_spotter_ids, {UUID(WORKER_1)})
+        self.assertIsNone(episode.scout_return_complete_tick)
+        self.assertEqual(tactic.scout_return_ids, set())
+
+        tactic.choose_actions(
+            make_turn(
+                tick=106,
+                units=[unit(WORKER_1, "WORKER", (0, 0), cargo=0)]
+                + home_defenders,
+            )
+        )
+
+        self.assertIsNone(tactic.active_raid_episode)
+        archived = tactic.raid_episode_history[-1]
+        self.assertEqual(archived.scout_return_complete_tick, 106)
+        self.assertEqual(archived.ready_tick, 106)
+
+    def test_core_loss_force_archives_active_raid_episode(self) -> None:
+        tactic, units = self._start_cut_raid()
+
+        tactic.choose_actions(
+            make_turn(tick=103, core=False, units=units)
+        )
+
+        self.assertIsNone(tactic.active_raid_episode)
+        archived = tactic.raid_episode_history[-1]
+        self.assertEqual(archived.outcome, "CORE_LOST")
+        self.assertEqual(archived.cycle_end_reason, "CORE_LOST")
+        self.assertEqual(archived.engagement_end_tick, 103)
+        self.assertEqual(archived.ready_tick, 103)
+
+    def test_respawn_recovery_force_archives_active_raid_episode(self) -> None:
+        tactic, units = self._start_cut_raid()
+        tactic.choose_actions(
+            make_turn(
+                tick=103,
+                units=units,
+                events=[
+                    {
+                        "event_id": "20000000-0000-4000-8000-000000000099",
+                        "tick": 102,
+                        "event_type": "CORE_RESPAWNED",
+                        "actor_id": CORE_ID,
+                        "position": [0, 0],
+                    }
+                ],
+            )
+        )
+
+        self.assertTrue(tactic.recovery_mode)
+        self.assertEqual(tactic.recovery_reason, "CORE_RESPAWNED")
+        self.assertIsNone(tactic.active_raid_episode)
+        archived = tactic.raid_episode_history[-1]
+        self.assertEqual(archived.outcome, "CORE_RESPAWNED")
+        self.assertEqual(archived.cycle_end_reason, "CORE_RESPAWNED")
+
+    def test_new_raid_supersedes_unfinished_episode_without_losing_history(self) -> None:
+        tactic, units = self._start_cut_raid()
+        next_turn = make_turn(
+            tick=103,
+            units=units,
+            enemies=[enemy_core(ENEMY_2, (31, 0))],
+        )
+        tactic.raid_mode = RaidMode.CUT
+        tactic.raid_target_last_durability = 10
+        tactic.raid_rebuild_vanguard_target = 2
+        tactic.raid_rebuild_ranger_target = 2
+
+        tactic._start_raid_episode(
+            next_turn,
+            next_turn.visible_enemies[0],
+            (*next_turn.vanguards[:1], *next_turn.rangers[:1]),
+            (),
+        )
+
+        self.assertEqual(tactic.active_raid_episode.target_id, UUID(ENEMY_2))
+        archived = tactic.raid_episode_history[-1]
+        self.assertEqual(archived.target_id, UUID(ENEMY_1))
+        self.assertEqual(archived.outcome, "SUPERSEDED")
+        self.assertEqual(archived.cycle_end_reason, "SUPERSEDED")
+        self.assertEqual(archived.ready_tick, 103)
+
+    def test_raid_episode_diagnostics_are_bounded_and_redacted(self) -> None:
+        tactic, units = self._start_cut_raid()
+        turn = make_turn(
+            tick=102,
+            units=units,
+            enemies=[enemy_core(ENEMY_1, (30, 0))],
+        )
+        tactic.choose_actions(turn)
+
+        diagnostics = _position_diagnostics(turn, tactic)
+
+        self.assertIn("raid_episode_state=ENGAGED", diagnostics)
+        self.assertIn("raid_episode_target=10000000", diagnostics)
+        self.assertIn("raid_episode_outcome=ACTIVE", diagnostics)
+        self.assertIn("raid_episode_started=102", diagnostics)
+        self.assertIn("raid_episode_pending_return=0", diagnostics)
+        self.assertIn("raid_episode_pending_scout=0", diagnostics)
+        self.assertIn("raid_episode_pending_rebuild=0V:0R", diagnostics)
+        self.assertIn("raid_episode_history=0", diagnostics)
+        self.assertIn("raid_episode_last=none", diagnostics)
+        self.assertNotIn(str(UUID(ENEMY_1)), diagnostics)
 
     def test_minimum_defense_fleet_raids_exposed_core_and_keeps_guards(self) -> None:
         tactic = CoreFarmer(worker_target=1, beacon_policy="hold")

@@ -84,6 +84,7 @@ CORE_RAID_SUPERIORITY_MARGIN = 3
 CORE_RAID_MAX_HP_LOSS_RATIO = 0.25
 CORE_RAID_NO_PROGRESS_TICKS = 10
 CORE_RAID_TARGET_COOLDOWN_TICKS = 16
+RAID_EPISODE_HISTORY_LIMIT = 8
 CORE_RAID_REINFORCEMENT_RADIUS = 7
 CORE_RAID_HOME_RESPONSE_RADIUS = 16
 CORE_RAID_CUT_VANGUARDS = 1
@@ -323,6 +324,75 @@ class CoreRaidTarget:
     id: UUID
     position: Position
     visible_enemy: object | None
+
+
+@dataclass(slots=True)
+class RaidEpisode:
+    target_id: UUID
+    mode: RaidMode
+    start_tick: int
+    start_resources: int
+    start_vanguard_count: int
+    start_ranger_count: int
+    initial_member_ids: frozenset[UUID]
+    initial_member_hp: int
+    initial_defender_count: int
+    initial_target_durability: int | None
+    rebuild_vanguard_target: int
+    rebuild_ranger_target: int
+    spotter_id: UUID | None = None
+    outcome: str = "ACTIVE"
+    engagement_end_tick: int | None = None
+    engagement_end_resources: int | None = None
+    last_target_durability: int | None = None
+    surviving_member_ids: frozenset[UUID] = frozenset()
+    return_member_ids: frozenset[UUID] = frozenset()
+    return_spotter_ids: frozenset[UUID] = frozenset()
+    squad_return_complete_tick: int | None = None
+    scout_return_complete_tick: int | None = None
+    rebuild_complete_tick: int | None = None
+    ready_tick: int | None = None
+    ready_resources: int | None = None
+    ready_vanguard_count: int | None = None
+    ready_ranger_count: int | None = None
+    cycle_end_reason: str = "PENDING"
+
+    @property
+    def state(self) -> str:
+        if self.engagement_end_tick is None:
+            return "ENGAGED"
+        if (
+            self.squad_return_complete_tick is None
+            or self.scout_return_complete_tick is None
+        ):
+            return "RETURNING"
+        if self.rebuild_complete_tick is None:
+            return "REBUILDING"
+        if self.ready_tick is None:
+            return "FINALIZING"
+        return "READY"
+
+    @property
+    def loss_count(self) -> int:
+        return len(self.initial_member_ids - self.surviving_member_ids)
+
+    @property
+    def engagement_duration(self) -> int | None:
+        if self.engagement_end_tick is None:
+            return None
+        return self.engagement_end_tick - self.start_tick
+
+    @property
+    def recovery_duration(self) -> int | None:
+        if self.engagement_end_tick is None or self.ready_tick is None:
+            return None
+        return self.ready_tick - self.engagement_end_tick
+
+    @property
+    def total_duration(self) -> int | None:
+        if self.ready_tick is None:
+            return None
+        return self.ready_tick - self.start_tick
 
 
 @dataclass(slots=True)
@@ -1764,6 +1834,10 @@ class CoreFarmer:
         self.raid_reserved_resources = 0
         self.raid_rebuild_vanguard_target = 0
         self.raid_rebuild_ranger_target = 0
+        self.active_raid_episode: RaidEpisode | None = None
+        self.raid_episode_history: deque[RaidEpisode] = deque(
+            maxlen=RAID_EPISODE_HISTORY_LIMIT,
+        )
         self.raid_target_cooldown_until: dict[UUID, int] = {}
         self.core_observer_candidates: dict[UUID, UUID] = {}
         self.core_observer_target_id: UUID | None = None
@@ -1829,6 +1903,169 @@ class CoreFarmer:
     def _release_core_observer(self) -> None:
         self.core_observer_target_id = None
         self.core_raid_spotter_id = None
+
+    def _start_raid_episode(
+        self,
+        turn: Turn,
+        target: object,
+        raid_members: Sequence[object],
+        defenders: Sequence[object],
+    ) -> None:
+        # A new tactical raid may start as soon as the strategy is ready again,
+        # even if an older episode was still waiting for a delayed observer
+        # return.  Keep the telemetry lossless by closing that older record
+        # explicitly before replacing the active pointer.
+        if self.active_raid_episode is not None:
+            self._interrupt_raid_episode(turn, "SUPERSEDED")
+        self.active_raid_episode = RaidEpisode(
+            target_id=target.id,
+            mode=self.raid_mode or RaidMode.CUT,
+            start_tick=turn.tick,
+            start_resources=turn.resources,
+            start_vanguard_count=len(turn.vanguards),
+            start_ranger_count=len(turn.rangers),
+            initial_member_ids=frozenset(unit.id for unit in raid_members),
+            initial_member_hp=sum(unit.hp for unit in raid_members),
+            initial_defender_count=len(defenders),
+            initial_target_durability=self.raid_target_last_durability,
+            rebuild_vanguard_target=self.raid_rebuild_vanguard_target,
+            rebuild_ranger_target=self.raid_rebuild_ranger_target,
+            last_target_durability=self.raid_target_last_durability,
+            surviving_member_ids=frozenset(unit.id for unit in raid_members),
+        )
+
+    def _mark_raid_episode_ready(
+        self,
+        turn: Turn,
+        *,
+        cycle_end_reason: str = "READY",
+        force: bool = False,
+    ) -> None:
+        episode = self.active_raid_episode
+        if episode is None:
+            return
+        if episode.engagement_end_tick is None:
+            if not force:
+                return
+            episode.engagement_end_tick = turn.tick
+            episode.engagement_end_resources = turn.resources
+            episode.outcome = cycle_end_reason
+        living_ids = {
+            unit.id
+            for unit in (*turn.vanguards, *turn.rangers)
+            if unit.id in episode.initial_member_ids
+        }
+        episode.surviving_member_ids = frozenset(living_ids)
+        if episode.squad_return_complete_tick is None:
+            episode.squad_return_complete_tick = turn.tick
+        if episode.scout_return_complete_tick is None:
+            episode.scout_return_complete_tick = turn.tick
+        if episode.rebuild_complete_tick is None:
+            episode.rebuild_complete_tick = turn.tick
+        episode.ready_tick = turn.tick
+        episode.ready_resources = turn.resources
+        episode.ready_vanguard_count = len(turn.vanguards)
+        episode.ready_ranger_count = len(turn.rangers)
+        episode.cycle_end_reason = cycle_end_reason
+        self.raid_episode_history.append(episode)
+        self.active_raid_episode = None
+
+    def _end_raid_episode(
+        self,
+        turn: Turn,
+        outcome: str,
+        *,
+        force_ready: bool = False,
+        cycle_end_reason: str = "PENDING",
+    ) -> None:
+        episode = self.active_raid_episode
+        if episode is None or episode.engagement_end_tick is not None:
+            return
+        episode.outcome = outcome
+        episode.engagement_end_tick = turn.tick
+        episode.engagement_end_resources = turn.resources
+        episode.last_target_durability = self.raid_target_last_durability
+        episode.surviving_member_ids = frozenset(
+            unit.id
+            for unit in (*turn.vanguards, *turn.rangers)
+            if unit.id in episode.initial_member_ids
+        )
+        episode.return_member_ids = frozenset(
+            episode.surviving_member_ids & self.squad_return_ids
+        )
+        if episode.spotter_id is not None and episode.spotter_id in self.scout_return_ids:
+            episode.return_spotter_ids = frozenset({episode.spotter_id})
+        if not episode.return_member_ids:
+            episode.squad_return_complete_tick = turn.tick
+        if not episode.return_spotter_ids:
+            episode.scout_return_complete_tick = turn.tick
+        if (
+            len(turn.vanguards) >= episode.rebuild_vanguard_target
+            and len(turn.rangers) >= episode.rebuild_ranger_target
+        ):
+            episode.rebuild_complete_tick = turn.tick
+        if force_ready:
+            self._mark_raid_episode_ready(
+                turn,
+                cycle_end_reason=cycle_end_reason or outcome,
+                force=True,
+            )
+
+    def _interrupt_raid_episode(self, turn: Turn, reason: str) -> None:
+        episode = self.active_raid_episode
+        if episode is None:
+            return
+        if episode.engagement_end_tick is None:
+            self._end_raid_episode(
+                turn,
+                reason,
+                force_ready=True,
+                cycle_end_reason=reason,
+            )
+        else:
+            self._mark_raid_episode_ready(
+                turn,
+                cycle_end_reason=reason,
+                force=True,
+            )
+
+    def _refresh_raid_episode(self, turn: Turn) -> None:
+        episode = self.active_raid_episode
+        if episode is None or episode.engagement_end_tick is None:
+            return
+        living_ids = {
+            unit.id
+            for unit in (*turn.vanguards, *turn.rangers)
+            if unit.id in episode.initial_member_ids
+        }
+        episode.surviving_member_ids = frozenset(living_ids)
+        if episode.return_member_ids.isdisjoint(self.squad_return_ids):
+            episode.squad_return_complete_tick = (
+                episode.squad_return_complete_tick or turn.tick
+            )
+        if episode.return_spotter_ids.isdisjoint(self.scout_return_ids):
+            episode.scout_return_complete_tick = (
+                episode.scout_return_complete_tick or turn.tick
+            )
+        if (
+            len(turn.vanguards) >= episode.rebuild_vanguard_target
+            and len(turn.rangers) >= episode.rebuild_ranger_target
+        ):
+            episode.rebuild_complete_tick = (
+                episode.rebuild_complete_tick or turn.tick
+            )
+        else:
+            # A unit can be lost after the engagement has ended while the
+            # strike group is travelling home.  Do not retain the provisional
+            # completion mark from the engagement tick; the episode must wait
+            # for the replacement fleet before it is archived.
+            episode.rebuild_complete_tick = None
+        if (
+            episode.squad_return_complete_tick is not None
+            and episode.scout_return_complete_tick is not None
+            and episode.rebuild_complete_tick is not None
+        ):
+            self._mark_raid_episode_ready(turn)
 
     def _release_core_raid(self, *, forget_position: bool = False) -> None:
         target_id = self.isolated_core_target_id
@@ -2360,6 +2597,12 @@ class CoreFarmer:
             self.raid_rebuild_ranger_target,
             len(turn.rangers),
         )
+        self._start_raid_episode(
+            turn,
+            target,
+            raid_members,
+            defenders,
+        )
 
         self.raid_last_defender_hp = sum(enemy.hp for enemy in defenders)
         if self.raid_mode is RaidMode.CUT:
@@ -2402,6 +2645,7 @@ class CoreFarmer:
             turn.tick + SQUAD_DISENGAGE_TICKS,
         )
         self.raid_abort_reason = "COMPLETED"
+        self._end_raid_episode(turn, "COMPLETED")
         self._release_core_raid(forget_position=True)
 
     def _abort_core_raid(
@@ -2433,6 +2677,7 @@ class CoreFarmer:
                 turn.tick + CORE_RAID_TARGET_COOLDOWN_TICKS
             )
         self.raid_abort_reason = reason
+        self._end_raid_episode(turn, reason)
         self._release_core_raid(forget_position=forget_position)
 
     def _raid_abort_reason_for_turn(
@@ -3215,6 +3460,8 @@ class CoreFarmer:
     def _select_isolated_core_target(self, turn: Turn) -> CoreRaidTarget | None:
         core = turn.core
         if core is None or self.recovery_mode:
+            if self.recovery_mode:
+                self._interrupt_raid_episode(turn, "RECOVERY_MODE")
             self._release_core_raid()
             return None
         for target_id, cooldown_until in tuple(
@@ -3376,6 +3623,8 @@ class CoreFarmer:
         self.core_raid_spotter_id = (
             observer_id if observer_id in living_empty_workers else None
         )
+        if self.active_raid_episode is not None:
+            self.active_raid_episode.spotter_id = self.core_raid_spotter_id
         return CoreRaidTarget(
             id=target.id,
             position=target.position,
@@ -3489,9 +3738,11 @@ class CoreFarmer:
             and _distance(turn.core.position, turn.beacon.position) >= 80
         )
         if respawned or (distant_low_stock and not self.recovery_mode):
+            reason = "CORE_RESPAWNED" if respawned else "REMOTE_LOW_FLEET"
+            self._interrupt_raid_episode(turn, reason)
             self._enter_recovery(
                 turn.tick,
-                "CORE_RESPAWNED" if respawned else "REMOTE_LOW_FLEET",
+                reason,
             )
             return
         if not self.recovery_mode:
@@ -4039,6 +4290,7 @@ class CoreFarmer:
     def choose_actions(self, turn: Turn) -> None:
         turn.clear()
         if turn.core is None:
+            self._interrupt_raid_episode(turn, "CORE_LOST")
             self._refresh_threat_assessment(turn)
             return
 
@@ -4046,6 +4298,7 @@ class CoreFarmer:
         if self.startup_tick is None:
             self.startup_tick = turn.tick
         self._refresh_return_states(turn)
+        self._refresh_raid_episode(turn)
         self._update_recovery_mode(turn)
         self._update_core_movement_history(turn)
         self._update_enemy_awareness(turn)
@@ -4058,6 +4311,7 @@ class CoreFarmer:
         if home_defense_pressure and active_raid_target is not None:
             self._abort_core_raid(turn, "HOME_DEFENSE")
         if self.compatibility_hold:
+            self._interrupt_raid_episode(turn, "COMPATIBILITY_HOLD")
             self._release_core_raid()
             self._release_core_observer()
         if self.compatibility_hold or home_defense_pressure:
@@ -6095,6 +6349,44 @@ def _position_diagnostics(turn: Turn, tactic: CoreFarmer) -> str:
             f"/p{core.view.move_progress}:{core.view.move_required_ticks}"
             f"->{core.view.destination[0]}:{core.view.destination[1]}"
         )
+    episode = tactic.active_raid_episode
+    if episode is None:
+        raid_episode_state = "IDLE"
+        raid_episode_target = "none"
+        raid_episode_outcome = "NONE"
+        raid_episode_started = 0
+        raid_episode_elapsed = 0
+        raid_episode_pending_return = 0
+        raid_episode_pending_scout = 0
+        raid_episode_pending_rebuild = "0V:0R"
+    else:
+        raid_episode_state = episode.state
+        raid_episode_target = str(episode.target_id)[:8]
+        raid_episode_outcome = episode.outcome
+        raid_episode_started = episode.start_tick
+        raid_episode_elapsed = turn.tick - episode.start_tick
+        raid_episode_pending_return = len(
+            episode.return_member_ids & tactic.squad_return_ids
+        )
+        raid_episode_pending_scout = len(
+            episode.return_spotter_ids & tactic.scout_return_ids
+        )
+        raid_episode_pending_rebuild = (
+            f"{max(0, episode.rebuild_vanguard_target - len(turn.vanguards))}V:"
+            f"{max(0, episode.rebuild_ranger_target - len(turn.rangers))}R"
+        )
+    last_episode = tactic.raid_episode_history[-1] if tactic.raid_episode_history else None
+    last_episode_summary = "none"
+    if last_episode is not None:
+        last_episode_summary = (
+            f"{last_episode.outcome}/{last_episode.cycle_end_reason}"
+            f"/t{last_episode.start_tick}-{last_episode.ready_tick}"
+            f"/e{last_episode.engagement_duration}"
+            f"/r{last_episode.recovery_duration}"
+            f"/loss{last_episode.loss_count}"
+            f"/res{last_episode.start_resources}>{last_episode.engagement_end_resources}"
+            f">{last_episode.ready_resources}"
+        )
     return (
         f"core={core.position[0]}:{core.position[1]} "
         f"core_state={core.view.state.value}{movement} "
@@ -6137,6 +6429,16 @@ def _position_diagnostics(turn: Turn, tactic: CoreFarmer) -> str:
         f"raid_missing={raid_missing_vanguards}V:{raid_missing_rangers}R "
         f"raid_abort_reason={tactic.raid_abort_reason} "
         f"raid_target_cooldowns={len(tactic.raid_target_cooldown_until)} "
+        f"raid_episode_state={raid_episode_state} "
+        f"raid_episode_target={raid_episode_target} "
+        f"raid_episode_outcome={raid_episode_outcome} "
+        f"raid_episode_started={raid_episode_started} "
+        f"raid_episode_elapsed={raid_episode_elapsed} "
+        f"raid_episode_pending_return={raid_episode_pending_return} "
+        f"raid_episode_pending_scout={raid_episode_pending_scout} "
+        f"raid_episode_pending_rebuild={raid_episode_pending_rebuild} "
+        f"raid_episode_history={len(tactic.raid_episode_history)} "
+        f"raid_episode_last={last_episode_summary} "
         f"clear_unit_target={str(tactic.stationary_unit_target_id)[:8] if tactic.stationary_unit_target_id else 'none'} "
         f"active_enemies={len(tactic.active_enemy_ids)} "
         f"preemptive_evade={len(tactic.preemptive_evade_enemy_ids)} "
