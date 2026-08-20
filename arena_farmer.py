@@ -1177,6 +1177,76 @@ def _queue_core_delivery_handoff(
         # useful work. Coordination is needed only when all exits are occupied.
         return set()
 
+    if (
+        context.friendly_counts[core.position] == 2
+        and core.position not in context.reserved_destinations
+    ):
+        for core_direction, entry_position in passable_neighbors:
+            if (
+                context.friendly_counts[entry_position] != 2
+                or entry_position in context.reserved_destinations
+            ):
+                continue
+            cargo_workers = sorted(
+                (
+                    worker
+                    for worker in turn.workers
+                    if worker.cargo > 0 and worker.position == entry_position
+                ),
+                key=_uuid_sort_key,
+            )
+            if len(cargo_workers) != 2:
+                continue
+
+            delivery_worker, sidestep_worker = cargo_workers
+            delivery_direction = _direction_to_adjacent(
+                entry_position,
+                core.position,
+            )
+            if delivery_direction is None:
+                continue
+            for sidestep_direction in CARDINAL_DIRECTIONS:
+                sidestep_position = _destination(
+                    entry_position,
+                    sidestep_direction,
+                )
+                if (
+                    sidestep_position == core.position
+                    or not _is_signed_int64_position(sidestep_position)
+                    or sidestep_position in context.obstacles
+                    or sidestep_position in context.enemy_cells
+                    or sidestep_position in context.danger_cells
+                    or sidestep_position in context.reserved_destinations
+                    or context.friendly_counts[sidestep_position] != 0
+                ):
+                    continue
+
+                handoff: set[UUID] = set()
+                if not _queue_move(
+                    sidestep_worker,
+                    (sidestep_direction,),
+                    context,
+                ):
+                    return handoff
+                handoff.add(sidestep_worker.id)
+                if not _queue_move(
+                    empty_worker,
+                    (core_direction,),
+                    context,
+                    allow_friendly_entry=entry_position,
+                ):
+                    return handoff
+                handoff.add(empty_worker.id)
+                if not _queue_move(
+                    delivery_worker,
+                    (delivery_direction,),
+                    context,
+                    allow_core_entry=True,
+                ):
+                    return handoff
+                handoff.add(delivery_worker.id)
+                return handoff
+
     units_by_position = {
         unit.position: unit
         for unit in turn.units

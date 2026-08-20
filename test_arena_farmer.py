@@ -2234,6 +2234,45 @@ class CoreFarmerTests(unittest.TestCase):
         self.assertEqual(queued["unit_actions"][WORKER_2]["type"], "MOVE")
         self.assertEqual(queued["unit_actions"][WORKER_2]["direction"], "LEFT")
 
+    def test_delivery_handoff_clears_double_occupied_corridor_from_live_deadlock(
+        self,
+    ) -> None:
+        tactic = CoreFarmer(worker_target=1, beacon_policy="retreat")
+        turn = make_turn(
+            tick=90,
+            core_position=(0, 0),
+            beacon_position=(10, 10),
+            units=[
+                unit(WORKER_1, "WORKER", (0, 0), cargo=0),
+                unit(WORKER_2, "WORKER", (1, 0), cargo=1),
+                unit(WORKER_3, "WORKER", (1, 0), cargo=1),
+                unit(WORKER_4, "WORKER", (-1, 0), cargo=0),
+                unit(VANGUARD_1, "VANGUARD", (-2, 0)),
+                unit(VANGUARD_2, "VANGUARD", (-2, 0)),
+            ],
+            obstacles=[
+                (0, -1),
+                (0, 1),
+                (-1, -1),
+                (-1, 1),
+            ],
+        )
+
+        tactic.choose_actions(turn)
+        queued = turn.plan.model_dump(mode="json", exclude_none=True)
+
+        self.assertEqual(queued["unit_actions"][WORKER_3]["direction"], "UP")
+        self.assertEqual(queued["unit_actions"][WORKER_1]["direction"], "RIGHT")
+        self.assertEqual(queued["unit_actions"][WORKER_2]["direction"], "LEFT")
+        self.assertEqual(
+            tactic.worker_modes[UUID(WORKER_1)],
+            "CLEAR_CORE_HANDOFF",
+        )
+        self.assertEqual(
+            tactic.worker_modes[UUID(WORKER_3)],
+            "DELIVERY_CHAIN_CARGO",
+        )
+
     def test_delivery_handoff_breaks_guarded_core_deadlock(self) -> None:
         tactic = CoreFarmer(worker_target=1, beacon_policy="retreat")
         blocked = make_turn(
