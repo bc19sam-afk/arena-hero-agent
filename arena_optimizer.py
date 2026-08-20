@@ -89,6 +89,19 @@ class WindowMetrics:
     core_healed: int = 0
     unit_healed: int = 0
     insufficient_spawn_failures: int = 0
+    # Observability-only combat/path telemetry. These fields intentionally do
+    # not participate in healthy() or score().
+    defense_axis_coverage: int | None = None
+    first_intercept_turns: int = 0
+    first_intercept_events: int = 0
+    core_exposed_axes: int | None = None
+    core_exposure_turns: int = 0
+    enemy_observation_age: int | None = None
+    stale_path_count: int = 0
+    task_reassignment_count: int = 0
+    empty_trip_count: int = 0
+    ranger_shot_blocked_by_obstacle: int = 0
+    ranger_focus_fire_targets: int = 0
 
     @property
     def healthy(self) -> bool:
@@ -373,6 +386,29 @@ def extract_window_metrics(log_text: str) -> WindowMetrics:
             metrics.core_healed += int(core_healed.group(1))
         if unit_healed:
             metrics.unit_healed += int(unit_healed.group(1))
+        telemetry_fields = {
+            "defense_axis_coverage": ("latest", int),
+            "first_intercept_turns": ("sum", int),
+            "first_intercept_events": ("sum", int),
+            "core_exposed_axes": ("latest", int),
+            "core_exposure_turns": ("max", int),
+            "enemy_observation_age": ("latest", int),
+            "stale_path_count": ("sum", int),
+            "task_reassignment_count": ("sum", int),
+            "empty_trip_count": ("sum", int),
+            "ranger_shot_blocked_by_obstacle": ("sum", int),
+            "ranger_focus_fire_targets": ("sum", int),
+        }
+        for field_name, (mode, converter) in telemetry_fields.items():
+            telemetry_match = re.search(rf"\b{field_name}=(-?\d+)", line)
+            if telemetry_match:
+                value = converter(telemetry_match.group(1))
+                if mode == "sum":
+                    setattr(metrics, field_name, getattr(metrics, field_name) + value)
+                elif mode == "max":
+                    setattr(metrics, field_name, max(getattr(metrics, field_name), value))
+                else:
+                    setattr(metrics, field_name, value)
         hp = re.search(r"\bcore_hp=(\d+)", line)
         shield = re.search(r"\bcore_shield=(\d+)", line)
         if hp:

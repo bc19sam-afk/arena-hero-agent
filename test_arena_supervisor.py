@@ -170,6 +170,12 @@ class SupervisorTests(unittest.TestCase):
                     "beacon_distance=200 known_resources=4 danger_cells=1 "
                     "combat_pressure=1 resource_blocked=12 scout_chunks=7 "
                     "scout_oldest_age=31 projected_core_damage=2 "
+                    "defense_axis_coverage=3 first_intercept_turns=1 "
+                    "first_intercept_events=1 "
+                    "core_exposed_axes=2 core_exposure_turns=4 "
+                    "enemy_observation_age=17 stale_path_count=2 "
+                    "task_reassignment_count=1 empty_trip_count=3 "
+                    "ranger_shot_blocked_by_obstacle=2 ranger_focus_fire_targets=1 "
                     "core_survival_margin=3 spawn_cost=16 spawn_required=0 "
                     "next_worker_cost=7 next_vanguard_cost=13 next_ranger_cost=16 "
                     "phase=STOCKPILE core_hp=5 core_shield=4"
@@ -199,6 +205,17 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(metrics.latest_scout_chunks, 7)
         self.assertEqual(metrics.latest_scout_oldest_age, 31)
         self.assertEqual(metrics.latest_projected_core_damage, 2)
+        self.assertEqual(metrics.defense_axis_coverage, 3)
+        self.assertEqual(metrics.first_intercept_turns, 1)
+        self.assertEqual(metrics.first_intercept_events, 1)
+        self.assertEqual(metrics.core_exposed_axes, 2)
+        self.assertEqual(metrics.core_exposure_turns, 4)
+        self.assertEqual(metrics.enemy_observation_age, 17)
+        self.assertEqual(metrics.stale_path_count, 2)
+        self.assertEqual(metrics.task_reassignment_count, 1)
+        self.assertEqual(metrics.empty_trip_count, 3)
+        self.assertEqual(metrics.ranger_shot_blocked_by_obstacle, 2)
+        self.assertEqual(metrics.ranger_focus_fire_targets, 1)
         self.assertEqual(metrics.latest_core_survival_margin, 3)
         self.assertEqual(metrics.min_core_survival_margin, 3)
         self.assertEqual(metrics.critical_core_margin_samples, 0)

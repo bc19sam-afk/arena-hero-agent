@@ -5,7 +5,7 @@ import io
 import tempfile
 import threading
 import unittest
-from collections import deque
+from collections import Counter, deque
 from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
@@ -27,9 +27,11 @@ from arena_farmer import (
     CORE_RAID_MEMORY_TTL,
     CORE_RAID_NO_PROGRESS_TICKS,
     CORE_RAID_TARGET_COOLDOWN_TICKS,
+    LOG_SNAPSHOT_INTERVAL,
     CoreFarmer,
     GlobalPosture,
     LifecycleMode,
+    MovementContext,
     RaidMode,
     RaidPhase,
     ResourceLedgerSnapshot,
@@ -43,6 +45,7 @@ from arena_farmer import (
     _position_diagnostics,
     _projected_core_resources,
     _ranger_can_shoot,
+    _ranger_guard_post,
     _reconcile_resource_turn,
     _should_log_turn,
     _has_vision_line,
@@ -630,6 +633,8 @@ class CoreFarmerTests(unittest.TestCase):
         self.assertEqual(tactic.last_released_targets[UUID(WORKER_1)], (3, 0))
         self.assertNotIn(UUID(WORKER_1), tactic.resource_intents)
         self.assertTrue(tactic.worker_modes[UUID(WORKER_1)].startswith("SCOUT"))
+        self.assertEqual(tactic.turn_stale_path_count, 1)
+        self.assertEqual(tactic.turn_task_reassignment_count, 1)
 
     def test_worker_keeps_resource_intent_through_temporary_fog(self) -> None:
         tactic = CoreFarmer()
@@ -724,6 +729,32 @@ class CoreFarmerTests(unittest.TestCase):
 
         self.assertEqual(targets[:3], [targets[0]] * 3)
         self.assertNotEqual(targets[3], targets[0])
+        self.assertEqual(tactic.turn_stale_path_count, 1)
+        self.assertEqual(tactic.turn_task_reassignment_count, 1)
+
+    def test_empty_resource_trip_is_counted_when_worker_returns_without_cargo(self) -> None:
+        tactic = CoreFarmer(worker_target=1, beacon_policy="hold")
+        outbound = make_turn(
+            tick=100,
+            units=[unit(WORKER_1, "WORKER", (1, 0), cargo=0)],
+            resource_cells=[(4, 0)],
+        )
+        tactic.choose_actions(outbound)
+        self.assertIn(UUID(WORKER_1), tactic.worker_resource_trip_targets)
+
+        returned_empty = make_turn(
+            tick=101,
+            units=[unit(WORKER_1, "WORKER", (0, 0), cargo=0)],
+        )
+        tactic.choose_actions(returned_empty)
+
+        self.assertEqual(tactic.turn_empty_trip_count, 1)
+        self.assertNotIn(UUID(WORKER_1), tactic.worker_resource_trip_targets)
+        self.assertFalse(returned_empty.visible_enemies)
+        self.assertFalse(returned_empty.events)
+        self.assertNotEqual(returned_empty.tick % LOG_SNAPSHOT_INTERVAL, 0)
+        self.assertTrue(_should_log_turn(returned_empty, tactic))
+        self.assertIn("empty_trip_count=1", _position_diagnostics(returned_empty, tactic))
 
     def test_interrupted_scout_returns_before_resuming_exploration(self) -> None:
         tactic = CoreFarmer(beacon_policy="hold")
@@ -2412,6 +2443,176 @@ class CoreFarmerTests(unittest.TestCase):
             {"WAIT"},
         )
 
+    def test_ranger_guard_post_prefers_clear_fire_lane_over_obstacle_cover(
+        self,
+    ) -> None:
+        turn = make_turn(
+            core_position=(0, 0),
+            units=[unit(RANGER_1, "RANGER", (1, 0))],
+            enemies=[unit(ENEMY_1, "VANGUARD", (2, 2), controlled=False)],
+            obstacles=[(2, 1)],
+        )
+        context = MovementContext(
+            obstacles={(2, 1)},
+            resource_cells=set(),
+            enemy_cells={(2, 2)},
+            danger_cells=set(),
+            discouraged_cells=set(),
+            friendly_counts=Counter({(1, 0): 1, (0, 0): 1}),
+            reserved_destinations=set(),
+            core_position=(0, 0),
+        )
+
+        destination = _ranger_guard_post(
+            turn.rangers[0],
+            (0, 0),
+            context,
+            (
+                Direction.RIGHT,
+                Direction.DOWN,
+                Direction.LEFT,
+                Direction.UP,
+            ),
+            2,
+            turn.visible_enemies,
+        )
+
+        self.assertEqual(destination, (0, 2))
+
+    def test_defense_axes_and_continuous_core_exposure_are_observed(self) -> None:
+        tactic = CoreFarmer(worker_target=1, beacon_policy="hold")
+        exposed_units = [
+            unit(VANGUARD_1, "VANGUARD", (0, -3)),
+            unit(RANGER_1, "RANGER", (-2, 0)),
+        ]
+        enemy = [unit(ENEMY_1, "RANGER", (6, 0), controlled=False)]
+
+        tactic.choose_actions(
+            make_turn(tick=100, units=exposed_units, enemies=enemy)
+        )
+        self.assertEqual(tactic.defense_axis_coverage, 2)
+        self.assertEqual(tactic.defense_axis_names, ("UP", "LEFT"))
+        self.assertEqual(tactic.core_exposed_axes, 1)
+        self.assertEqual(tactic.core_exposed_axis_names, ("RIGHT",))
+        self.assertEqual(tactic.core_exposure_turns, 1)
+
+        tactic.choose_actions(
+            make_turn(tick=101, units=exposed_units, enemies=enemy)
+        )
+        self.assertEqual(tactic.core_exposure_turns, 2)
+
+        tactic.choose_actions(
+            make_turn(
+                tick=102,
+                units=[*exposed_units, unit(RANGER_2, "RANGER", (2, 0))],
+                enemies=enemy,
+            )
+        )
+        self.assertEqual(tactic.defense_axis_coverage, 3)
+        self.assertEqual(tactic.core_exposed_axes, 0)
+        self.assertEqual(tactic.core_exposed_axis_names, ())
+        self.assertEqual(tactic.core_exposure_turns, 0)
+
+    def test_first_intercept_delay_is_emitted_once_per_enemy_contact(self) -> None:
+        tactic = CoreFarmer(worker_target=1, beacon_policy="hold")
+        enemy = [unit(ENEMY_1, "RANGER", (3, 2), controlled=False)]
+
+        tactic.choose_actions(make_turn(tick=100, enemies=enemy))
+        self.assertEqual(tactic.turn_first_intercept_turns, 0)
+        self.assertEqual(tactic.turn_first_intercept_events, 0)
+
+        intercepted = make_turn(
+            tick=101,
+            units=[unit(RANGER_1, "RANGER", (0, 2))],
+            enemies=enemy,
+        )
+        tactic.choose_actions(intercepted)
+        actions = intercepted.plan.model_dump(mode="json", exclude_none=True)
+        self.assertEqual(actions["unit_actions"][RANGER_1]["type"], "SHOOT")
+        self.assertEqual(tactic.turn_first_intercept_turns, 1)
+        self.assertEqual(tactic.turn_first_intercept_events, 1)
+
+        tactic.choose_actions(
+            make_turn(
+                tick=102,
+                units=[unit(RANGER_1, "RANGER", (0, 2))],
+                enemies=enemy,
+            )
+        )
+        self.assertEqual(tactic.turn_first_intercept_turns, 0)
+        self.assertEqual(tactic.turn_first_intercept_events, 0)
+
+    def test_first_intercept_contact_survives_one_hidden_tick(self) -> None:
+        tactic = CoreFarmer(worker_target=1, beacon_policy="hold")
+        enemy = unit(ENEMY_1, "RANGER", (3, 2), controlled=False)
+
+        tactic.choose_actions(make_turn(tick=100, enemies=[enemy]))
+        tactic.choose_actions(make_turn(tick=101))
+
+        intercepted = make_turn(
+            tick=102,
+            units=[unit(RANGER_1, "RANGER", (0, 2))],
+            enemies=[enemy],
+        )
+        tactic.choose_actions(intercepted)
+
+        self.assertEqual(tactic.turn_first_intercept_turns, 2)
+        self.assertEqual(tactic.turn_first_intercept_events, 1)
+
+    def test_zero_latency_first_intercept_is_distinct_from_no_event(self) -> None:
+        tactic = CoreFarmer(worker_target=1, beacon_policy="hold")
+        intercepted = make_turn(
+            tick=100,
+            units=[unit(RANGER_1, "RANGER", (0, 2))],
+            enemies=[unit(ENEMY_1, "RANGER", (3, 2), controlled=False)],
+        )
+
+        tactic.choose_actions(intercepted)
+
+        self.assertEqual(tactic.turn_first_intercept_turns, 0)
+        self.assertEqual(tactic.turn_first_intercept_events, 1)
+
+    def test_hidden_enemy_observation_age_uses_retained_motion_memory(self) -> None:
+        tactic = CoreFarmer(worker_target=1, beacon_policy="hold")
+        tactic.choose_actions(
+            make_turn(
+                tick=100,
+                enemies=[unit(ENEMY_1, "RANGER", (8, 0), controlled=False)],
+            )
+        )
+        self.assertEqual(tactic.enemy_observation_age, 0)
+
+        tactic.choose_actions(make_turn(tick=101))
+
+        self.assertEqual(tactic.enemy_observation_age, 1)
+
+    def test_ranger_observability_counts_blocked_shots_and_focus_fire(self) -> None:
+        blocked = CoreFarmer(worker_target=1, beacon_policy="hold")
+        blocked.choose_actions(
+            make_turn(
+                tick=100,
+                core_position=(0, 5),
+                units=[unit(RANGER_1, "RANGER", (0, 0))],
+                enemies=[unit(ENEMY_1, "RANGER", (3, 0), controlled=False)],
+                obstacles=[(1, 0)],
+            )
+        )
+        self.assertEqual(blocked.turn_ranger_shot_blocked_by_obstacle, 1)
+
+        focused = CoreFarmer(worker_target=1, beacon_policy="hold")
+        focus_turn = make_turn(
+            tick=100,
+            core_position=(0, 5),
+            units=[
+                unit(RANGER_1, "RANGER", (0, 0)),
+                unit(RANGER_2, "RANGER", (1, 0)),
+            ],
+            enemies=[unit(ENEMY_1, "RANGER", (3, 0), controlled=False, hp=4)],
+        )
+        focused.choose_actions(focus_turn)
+
+        self.assertEqual(focused.turn_ranger_focus_fire_targets, 1)
+
     def test_confirmed_isolated_core_uses_strike_group_and_keeps_guards(self) -> None:
         tactic = CoreFarmer(worker_target=1, beacon_policy="hold")
         units = [
@@ -3874,6 +4075,22 @@ class CoreFarmerTests(unittest.TestCase):
         self.assertIn("global_posture=NORMAL", diagnostics)
         self.assertIn("threat_level=NORMAL", diagnostics)
         self.assertIn("threat_reason=NONE", diagnostics)
+        for field in (
+            "defense_axis_coverage=",
+            "defense_axis_names=",
+            "first_intercept_turns=",
+            "first_intercept_events=",
+            "core_exposed_axes=",
+            "core_exposed_axis_names=",
+            "core_exposure_turns=",
+            "enemy_observation_age=",
+            "stale_path_count=",
+            "task_reassignment_count=",
+            "empty_trip_count=",
+            "ranger_shot_blocked_by_obstacle=",
+            "ranger_focus_fire_targets=",
+        ):
+            self.assertIn(field, diagnostics)
         self.assertIn("raid_mode=none", diagnostics)
         self.assertIn("raid_phase=none", diagnostics)
         self.assertIn("raid_group=0V:0R", diagnostics)

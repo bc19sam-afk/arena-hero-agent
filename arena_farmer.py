@@ -1644,6 +1644,62 @@ def _guard_post(
     return unit.position
 
 
+def _ranger_guard_post(
+    unit: Movable,
+    core_position: Position,
+    context: MovementContext,
+    preferred_directions: Sequence[Direction],
+    radius: int,
+    enemies: Sequence[object],
+) -> Position:
+    """Small strategy experiment: prefer a usable firing lane, then cover."""
+    candidates: list[Position] = []
+    for direction in preferred_directions:
+        dx, dy = direction.delta
+        destination = (
+            core_position[0] + dx * radius,
+            core_position[1] + dy * radius,
+        )
+        if destination in context.obstacles or destination in context.resource_cells:
+            continue
+        if destination in context.enemy_cells or destination in context.danger_cells:
+            continue
+        if destination in context.reserved_destinations:
+            continue
+        if destination != unit.position and context.friendly_counts[destination]:
+            continue
+        candidates.append(destination)
+
+    combat_enemies = tuple(
+        enemy
+        for enemy in enemies
+        if getattr(enemy, "kind", None) != "CORE"
+        and getattr(enemy, "unit_type", None) in {UnitType.VANGUARD, UnitType.RANGER}
+    )
+    for destination in candidates:
+        if any(
+            _ranger_can_shoot(destination, enemy.position, context.obstacles)
+            for enemy in combat_enemies
+        ):
+            return destination
+
+    for destination in candidates:
+        if any(
+            _distance(destination, obstacle) == 1
+            for obstacle in context.obstacles
+        ):
+            return destination
+
+    # If no clear lane is available, retain the normal stable guard ordering.
+    return _guard_post(
+        unit,
+        core_position,
+        context,
+        preferred_directions,
+        radius,
+    )
+
+
 def _combat_target_key(origin: Position, enemy: object) -> tuple[object, ...]:
     unit_type = getattr(enemy, "unit_type", None)
     type_priority = (
@@ -1857,6 +1913,7 @@ class CoreFarmer:
         self.resource_intents: dict[UUID, Position] = {}
         self.resource_progress: dict[UUID, ResourceProgress] = {}
         self.resource_cooldowns: dict[tuple[UUID, Position], int] = {}
+        self.worker_resource_trip_targets: dict[UUID, Position] = {}
         self.worker_modes: dict[UUID, str] = {}
         self.worker_targets: dict[UUID, Position] = {}
         self.last_danger_cells: set[Position] = set()
@@ -1915,10 +1972,164 @@ class CoreFarmer:
         self.stationary_unit_target_id: UUID | None = None
         self.threat_caution_until_tick = 0
         self.startup_tick: int | None = None
+        self.enemy_contact_start_tick: int | None = None
+        self.enemy_contact_intercept_recorded = False
+        self.enemy_contact_enemy_ids: set[UUID] = set()
+        self.core_exposure_start_tick: int | None = None
+        self.defense_axis_coverage = 0
+        self.defense_axis_names: tuple[str, ...] = ()
+        self.core_exposed_axes = 0
+        self.core_exposed_axis_names: tuple[str, ...] = ()
+        self.core_exposure_turns = 0
+        self.enemy_observation_age = 0
+        self.turn_stale_path_count = 0
+        self.turn_task_reassignment_count = 0
+        self.turn_empty_trip_count = 0
+        self.turn_first_intercept_turns = 0
+        self.turn_first_intercept_events = 0
+        self.turn_ranger_shot_blocked_by_obstacle = 0
+        self.turn_ranger_focus_fire_targets = 0
 
     @property
     def recovery_mode(self) -> bool:
         return self.recovery_until_tick > 0
+
+    def _reset_turn_observability(self) -> None:
+        self.turn_stale_path_count = 0
+        self.turn_task_reassignment_count = 0
+        self.turn_empty_trip_count = 0
+        self.turn_first_intercept_turns = 0
+        self.turn_first_intercept_events = 0
+        self.turn_ranger_shot_blocked_by_obstacle = 0
+        self.turn_ranger_focus_fire_targets = 0
+
+    def _refresh_worker_trip_observability(self, turn: Turn) -> None:
+        core = turn.core
+        if core is None:
+            self.worker_resource_trip_targets.clear()
+            return
+        workers = {worker.id: worker for worker in turn.workers}
+        for worker_id in tuple(self.worker_resource_trip_targets):
+            worker = workers.get(worker_id)
+            if worker is None or worker.cargo > 0:
+                self.worker_resource_trip_targets.pop(worker_id, None)
+                continue
+            if worker.position == core.position:
+                self.turn_empty_trip_count += 1
+                self.worker_resource_trip_targets.pop(worker_id, None)
+
+    def _refresh_combat_observability(
+        self,
+        turn: Turn,
+        mobile_enemies: Sequence[object],
+    ) -> None:
+        core = turn.core
+        if core is None:
+            self.defense_axis_coverage = 0
+            self.defense_axis_names = ()
+            self.core_exposed_axes = 0
+            self.core_exposed_axis_names = ()
+            self.core_exposure_turns = 0
+            self.enemy_observation_age = 0
+            self.enemy_contact_start_tick = None
+            self.enemy_contact_intercept_recorded = False
+            self.enemy_contact_enemy_ids.clear()
+            self.core_exposure_start_tick = None
+            return
+
+        covered_axes = {
+            _directions_toward(core.position, defender.position)[0]
+            for defender in (*turn.vanguards, *turn.rangers)
+            if defender.position != core.position
+        }
+        self.defense_axis_names = tuple(
+            direction.value
+            for direction in CARDINAL_DIRECTIONS
+            if direction in covered_axes
+        )
+        self.defense_axis_coverage = len(self.defense_axis_names)
+
+        threatened_axes = {
+            _directions_toward(core.position, enemy.position)[0]
+            for enemy in mobile_enemies
+            if _distance(core.position, enemy.position) <= CORE_EVADE_TRIGGER_DISTANCE
+        }
+        exposed_axes = threatened_axes - covered_axes
+        self.core_exposed_axis_names = tuple(
+            direction.value
+            for direction in CARDINAL_DIRECTIONS
+            if direction in exposed_axes
+        )
+        self.core_exposed_axes = len(self.core_exposed_axis_names)
+        if exposed_axes:
+            if self.core_exposure_start_tick is None:
+                self.core_exposure_start_tick = turn.tick
+            self.core_exposure_turns = turn.tick - self.core_exposure_start_tick + 1
+        else:
+            self.core_exposure_start_tick = None
+            self.core_exposure_turns = 0
+
+        self.enemy_observation_age = max(
+            (
+                turn.tick - motion.last_tick
+                for motion in self.enemy_unit_motion.values()
+            ),
+            default=0,
+        )
+        if mobile_enemies:
+            visible_contact_ids = {
+                enemy.id
+                for enemy in mobile_enemies
+            }
+            if self.enemy_contact_start_tick is None:
+                self.enemy_contact_start_tick = turn.tick
+                self.enemy_contact_intercept_recorded = False
+                self.enemy_contact_enemy_ids = visible_contact_ids
+            else:
+                self.enemy_contact_enemy_ids.update(visible_contact_ids)
+        else:
+            retained_contact_ids = (
+                self.enemy_contact_enemy_ids & self.enemy_unit_motion.keys()
+            )
+            if retained_contact_ids:
+                self.enemy_contact_enemy_ids = set(retained_contact_ids)
+            else:
+                self.enemy_contact_start_tick = None
+                self.enemy_contact_intercept_recorded = False
+                self.enemy_contact_enemy_ids.clear()
+
+        # This is a geometric count of currently blocked Ranger/enemy lanes,
+        # not a count of rejected or failed SHOOT actions.
+        self.turn_ranger_shot_blocked_by_obstacle = sum(
+            _ranger_can_shoot(ranger.position, enemy.position, set())
+            and not _ranger_can_shoot(
+                ranger.position,
+                enemy.position,
+                self.known_obstacles,
+            )
+            for ranger in turn.rangers
+            for enemy in mobile_enemies
+        )
+
+    def _record_first_intercept_observability(
+        self,
+        turn: Turn,
+        planned_damage: Mapping[UUID, int],
+    ) -> None:
+        if (
+            self.enemy_contact_start_tick is None
+            or self.enemy_contact_intercept_recorded
+        ):
+            return
+        if any(
+            planned_damage.get(enemy_id, 0) > 0
+            for enemy_id in self.enemy_contact_enemy_ids
+        ):
+            self.turn_first_intercept_turns = (
+                turn.tick - self.enemy_contact_start_tick
+            )
+            self.turn_first_intercept_events = 1
+            self.enemy_contact_intercept_recorded = True
 
     def strategy_phase(self, turn: Turn) -> str:
         if turn.core is None:
@@ -3925,6 +4136,8 @@ class CoreFarmer:
             self.resource_intents.pop(worker_id, None)
             self.resource_progress.pop(worker_id, None)
             self.last_released_targets[worker_id] = target
+            self.turn_stale_path_count += 1
+            self.turn_task_reassignment_count += 1
 
     def _assign_resource_targets(
         self,
@@ -4182,6 +4395,8 @@ class CoreFarmer:
         assigned_target: Position | None,
         context: MovementContext,
     ) -> None:
+        if assigned_target is not None and worker.position != core_position:
+            self.worker_resource_trip_targets[worker.id] = assigned_target
         if (
             assigned_target == worker.position
             and worker.position in current_resources
@@ -4228,6 +4443,8 @@ class CoreFarmer:
         elif self._scout_route_stalled(worker, target, context):
             self.scout_progress.pop(worker.id, None)
             self._advance_scout(worker.id, tick=tick)
+            self.turn_stale_path_count += 1
+            self.turn_task_reassignment_count += 1
             target = self._scout_target(
                 worker.id,
                 core_position,
@@ -4241,6 +4458,8 @@ class CoreFarmer:
             discouraged=set(self.worker_history[worker.id]),
         ):
             self._advance_scout(worker.id, tick=tick)
+            self.turn_stale_path_count += 1
+            self.turn_task_reassignment_count += 1
             target = self._scout_target(
                 worker.id,
                 core_position,
@@ -4359,12 +4578,16 @@ class CoreFarmer:
 
     def choose_actions(self, turn: Turn) -> None:
         turn.clear()
+        self._reset_turn_observability()
         if turn.core is None:
+            self._refresh_worker_trip_observability(turn)
+            self._refresh_combat_observability(turn, ())
             self._interrupt_raid_episode(turn, "CORE_LOST")
             self._refresh_threat_assessment(turn)
             return
 
         core = turn.core
+        self._refresh_worker_trip_observability(turn)
         if self.startup_tick is None:
             self.startup_tick = turn.tick
         self._refresh_return_states(turn)
@@ -4411,6 +4634,7 @@ class CoreFarmer:
             if getattr(enemy, "kind") != "CORE"
             and enemy.unit_type in {UnitType.VANGUARD, UnitType.RANGER}
         )
+        self._refresh_combat_observability(turn, mobile_enemies)
         if self._strike_group_locally_threatened(
             turn,
             combat_target,
@@ -4685,6 +4909,7 @@ class CoreFarmer:
             combat_target,
             planned_damage,
         )
+        ranger_damage_before = dict(planned_damage)
         self._control_rangers(
             turn,
             mobile_enemies,
@@ -4692,7 +4917,12 @@ class CoreFarmer:
             combat_target,
             planned_damage,
         )
+        self.turn_ranger_focus_fire_targets = sum(
+            damage - ranger_damage_before.get(target_id, 0) >= 2
+            for target_id, damage in planned_damage.items()
+        )
         self._control_core(turn, context, combat_target)
+        self._record_first_intercept_observability(turn, planned_damage)
 
     def _strike_group_ids(
         self,
@@ -5531,7 +5761,7 @@ class CoreFarmer:
                 _record_planned_target_damage(target, planned_damage)
                 continue
             if self.combat_pressure_active:
-                target_position = _guard_post(
+                target_position = _ranger_guard_post(
                     ranger,
                     core.position,
                     context,
@@ -5545,6 +5775,7 @@ class CoreFarmer:
                         ),
                     ),
                     RANGER_GUARD_RADIUS,
+                    enemies,
                 )
                 if target_position != ranger.position and _queue_toward(
                     ranger,
@@ -5579,7 +5810,7 @@ class CoreFarmer:
                 ranger.wait()
                 continue
 
-            target_position = _guard_post(
+            target_position = _ranger_guard_post(
                 ranger,
                 core.position,
                 context,
@@ -5593,6 +5824,7 @@ class CoreFarmer:
                     index,
                 ),
                 RANGER_GUARD_RADIUS,
+                enemies,
             )
             if target_position != ranger.position:
                 moved = _queue_toward(
@@ -6468,6 +6700,19 @@ def _position_diagnostics(turn: Turn, tactic: CoreFarmer) -> str:
         f"danger_cells={len(tactic.last_danger_cells)} "
         f"projected_core_damage={tactic.last_projected_core_damage} "
         f"core_survival_margin={tactic.last_core_survival_margin} "
+        f"defense_axis_coverage={tactic.defense_axis_coverage} "
+        f"defense_axis_names={','.join(tactic.defense_axis_names) or 'none'} "
+        f"first_intercept_turns={tactic.turn_first_intercept_turns} "
+        f"first_intercept_events={tactic.turn_first_intercept_events} "
+        f"core_exposed_axes={tactic.core_exposed_axes} "
+        f"core_exposed_axis_names={','.join(tactic.core_exposed_axis_names) or 'none'} "
+        f"core_exposure_turns={tactic.core_exposure_turns} "
+        f"enemy_observation_age={tactic.enemy_observation_age} "
+        f"stale_path_count={tactic.turn_stale_path_count} "
+        f"task_reassignment_count={tactic.turn_task_reassignment_count} "
+        f"empty_trip_count={tactic.turn_empty_trip_count} "
+        f"ranger_shot_blocked_by_obstacle={tactic.turn_ranger_shot_blocked_by_obstacle} "
+        f"ranger_focus_fire_targets={tactic.turn_ranger_focus_fire_targets} "
         f"defender_on_core={defender_on_core} "
         f"delivery_blocked={delivery_blocked} "
         f"resource_blocked={resource_blocked} "
@@ -6603,11 +6848,25 @@ def _has_significant_events(turn: Turn) -> bool:
     return any(event.event_type not in routine_events for event in turn.events)
 
 
-def _should_log_turn(turn: Turn) -> bool:
+def _has_edge_observability_events(tactic: CoreFarmer) -> bool:
+    return any(
+        (
+            tactic.turn_stale_path_count,
+            tactic.turn_task_reassignment_count,
+            tactic.turn_empty_trip_count,
+            tactic.turn_first_intercept_events,
+            tactic.turn_ranger_shot_blocked_by_obstacle,
+            tactic.turn_ranger_focus_fire_targets,
+        )
+    )
+
+
+def _should_log_turn(turn: Turn, tactic: CoreFarmer | None = None) -> bool:
     return (
         bool(turn.visible_enemies)
         or turn.tick % LOG_SNAPSHOT_INTERVAL == 0
         or _has_significant_events(turn)
+        or (tactic is not None and _has_edge_observability_events(tactic))
     )
 
 
@@ -6750,7 +7009,7 @@ def play(
                         population=len(turn.units),
                         core_alive=turn.core is not None,
                     )
-                if _should_log_turn(turn):
+                if _should_log_turn(turn, tactic):
                     actions, events = _turn_diagnostics(turn)
                     print(
                         f"tick={accepted.tick} accepted={accepted.accepted} "

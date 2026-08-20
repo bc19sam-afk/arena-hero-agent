@@ -84,6 +84,35 @@ class OptimizerTests(unittest.TestCase):
         self.assertEqual(metrics.harvests, 21)
         self.assertGreater(metrics.score, 0)
 
+    def test_extract_window_metrics_preserves_observability_telemetry(self) -> None:
+        lines = healthy_log(1000).splitlines()
+        log = "\n".join(
+            line.replace(
+                "danger_cells=0 core_hp=5 core_shield=5",
+                "danger_cells=0 core_hp=5 core_shield=5 "
+                "defense_axis_coverage=3 first_intercept_turns=1 "
+                "first_intercept_events=1 "
+                f"core_exposed_axes=2 core_exposure_turns={4 if index == 0 else 1} "
+                "enemy_observation_age=17 stale_path_count=2 "
+                "task_reassignment_count=1 empty_trip_count=3 "
+                "ranger_shot_blocked_by_obstacle=2 ranger_focus_fire_targets=1",
+            )
+            for index, line in enumerate(lines)
+        )
+        metrics = extract_window_metrics(log)
+        self.assertEqual(metrics.defense_axis_coverage, 3)
+        self.assertEqual(metrics.first_intercept_turns, 21)
+        self.assertEqual(metrics.first_intercept_events, 21)
+        self.assertEqual(metrics.core_exposed_axes, 2)
+        self.assertEqual(metrics.core_exposure_turns, 4)
+        self.assertEqual(metrics.enemy_observation_age, 17)
+        self.assertEqual(metrics.stale_path_count, 42)
+        self.assertEqual(metrics.task_reassignment_count, 21)
+        self.assertEqual(metrics.empty_trip_count, 63)
+        self.assertEqual(metrics.ranger_shot_blocked_by_obstacle, 42)
+        self.assertEqual(metrics.ranger_focus_fire_targets, 21)
+        self.assertTrue(metrics.healthy)
+
     def test_mixed_generation_window_is_not_eligible(self) -> None:
         mixed = "\n".join(
             [

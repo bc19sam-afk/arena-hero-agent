@@ -141,6 +141,19 @@ class Metrics:
     action_counts: dict[str, int] = field(default_factory=dict)
     event_counts: dict[str, int] = field(default_factory=dict)
     warning_counts: dict[str, int] = field(default_factory=dict)
+    # Review-visible telemetry; deliberately excluded from deterministic
+    # severity and model-trigger thresholds for now.
+    defense_axis_coverage: int | None = None
+    first_intercept_turns: int = 0
+    first_intercept_events: int = 0
+    core_exposed_axes: int | None = None
+    core_exposure_turns: int = 0
+    enemy_observation_age: int | None = None
+    stale_path_count: int = 0
+    task_reassignment_count: int = 0
+    empty_trip_count: int = 0
+    ranger_shot_blocked_by_obstacle: int = 0
+    ranger_focus_fire_targets: int = 0
 
 
 @dataclass
@@ -354,6 +367,30 @@ def extract_metrics(log_text: str) -> Metrics:
             metrics.core_healed += int(core_healed.group(1))
         if unit_healed:
             metrics.unit_healed += int(unit_healed.group(1))
+
+        telemetry_fields = {
+            "defense_axis_coverage": "latest",
+            "first_intercept_turns": "sum",
+            "first_intercept_events": "sum",
+            "core_exposed_axes": "latest",
+            "core_exposure_turns": "max",
+            "enemy_observation_age": "latest",
+            "stale_path_count": "sum",
+            "task_reassignment_count": "sum",
+            "empty_trip_count": "sum",
+            "ranger_shot_blocked_by_obstacle": "sum",
+            "ranger_focus_fire_targets": "sum",
+        }
+        for field_name, mode in telemetry_fields.items():
+            telemetry_match = re.search(rf"\b{field_name}=(-?\d+)", line)
+            if telemetry_match:
+                value = int(telemetry_match.group(1))
+                if mode == "sum":
+                    setattr(metrics, field_name, getattr(metrics, field_name) + value)
+                elif mode == "max":
+                    setattr(metrics, field_name, max(getattr(metrics, field_name), value))
+                else:
+                    setattr(metrics, field_name, value)
 
         spawn_cost = INTEGER_FIELDS["spawn_cost"].search(line)
         spawn_required = INTEGER_FIELDS["spawn_required"].search(line)
